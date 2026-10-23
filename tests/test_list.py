@@ -34,12 +34,24 @@ def event(identifier="command-1", text="/list", topic="test-commands", now=1000)
 class MemoryState:
     def __init__(self):
         self.ids = set()
+        self.agents = {}
 
     def seen(self, event_id):
         return event_id in self.ids
 
     def mark(self, event_id, now):
         self.ids.add(event_id)
+
+    def online_agents(self, cluster):
+        return {device_id: record[0] for (scope, device_id), record in self.agents.items()
+                if scope == cluster and record[1]}
+
+    def remember_agent(self, cluster, device_id, name, now):
+        self.agents[(cluster, device_id)] = (name, True)
+
+    def offline_agent(self, cluster, device_id):
+        name, _ = self.agents[(cluster, device_id)]
+        self.agents[(cluster, device_id)] = (name, False)
 
 
 class CaptureNtfy:
@@ -80,9 +92,9 @@ class CommandTests(unittest.TestCase):
         instance = make_bridge(names=["Fix quizzes", "Music player", "Untitled chat"])
         instance.handle(event(), 1000)
         deliver_messages(instance, instance, "bus")
-        instance.finish(1007)
-        self.assertEqual(len(instance.ntfy.messages), 1)
-        instance.finish(1009)
+        # There is no collection delay once this computer has responded.
+        instance.finish(1000.01)
+        self.assertEqual(len(instance.ntfy.messages), 2)
         topic, reply, title = instance.ntfy.messages[-1]
         self.assertEqual(topic, "test-commands")
         self.assertEqual(title, "Codex chats")
@@ -212,6 +224,157 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(all(len(text.encode()) <= bridge.MAX_BODY for text in replies))
         for name in names:
             self.assertIn(name, "\n".join(replies))
+
+
+class EarlyCompletionTests(unittest.TestCase):
+    def register(self, instance, device_id, name, identifier="online"):
+        payload = {"version": 1, "kind": "agent_online", "sent_at": 1000,
+                   "request_id": device_id, "device_id": device_id, "device_name": name}
+        instance.handle(event(identifier, bridge.signed(payload, instance.config.bus_secret), "test-bus"), 1000)
+
+    def test_waits_for_last_registered_computer_then_replies_immediately(self):
+        coordinator = make_bridge(config(role="coordinator"))
+        self.register(coordinator, "mac-1", "Mac", "online-mac")
+        self.register(coordinator, "desktop-1", "Desktop", "online-desktop")
+        mac = make_bridge(config(role="agent"), ["Mac chat"])
+        desktop = make_bridge(config(role="agent", device_id="desktop-1", device_name="Desktop"), ["Desktop chat"])
+        coordinator.handle(event(), 1000)
+        with patch.object(bridge.time, "time", return_value=1000):
+            deliver_messages(coordinator, mac, "mac-request")
+            deliver_messages(coordinator, desktop, "desktop-request")
+        deliver_messages(mac, coordinator, "mac-report")
+        coordinator.finish(1000.01)
+        self.assertFalse(any(item[0] == "test-commands" for item in coordinator.ntfy.messages))
+        deliver_messages(desktop, coordinator, "desktop-report")
+        coordinator.finish(1000.02)
+        replies = [item for item in coordinator.ntfy.messages if item[0] == "test-commands"]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("Mac chat", replies[0][1])
+        self.assertIn("Desktop chat", replies[0][1])
+        self.assertEqual(coordinator.pending, {})
+
+    def test_missing_computer_uses_timeout_then_no_longer_delays_next_request(self):
+        instance = make_bridge()
+        self.register(instance, "missing", "Missing computer")
+        instance.handle(event(), 1000)
+        deliver_messages(instance, instance, "local-report")
+        instance.finish(1000.1)
+        self.assertEqual(len(instance.ntfy.messages), 1)
+        instance.finish(1008)
+        self.assertIn("Missing computer:\nNo response (offline or timed out).", instance.ntfy.messages[-1][1])
+        self.assertNotIn("missing", instance.state.online_agents(instance.cluster))
+        instance.handle(event("next", now=1009), 1009)
+        with patch.object(bridge.time, "time", return_value=1009):
+            deliver_messages(instance, instance, "next-report", now=1009)
+        instance.finish(1009.1)
+        self.assertEqual(instance.pending, {})
+
+    def test_incomplete_multipart_report_is_not_counted_as_a_response(self):
+        coordinator = make_bridge(config(role="coordinator"))
+        self.register(coordinator, "mac-1", "Mac")
+        coordinator.handle(event(), 1000)
+        payload = {"kind": "list_report", "request_id": "command-1", "device_id": "mac-1",
+                   "device_name": "Mac", "names": ["Chat A"], "part": 0, "parts": 2}
+        coordinator._bus(payload, 1000)
+        coordinator.finish(1000.1)
+        self.assertEqual(len(coordinator.ntfy.messages), 1)
+        coordinator._bus({**payload, "part": 1, "names": ["Chat B"]}, 1000)
+        coordinator.finish(1000.2)
+        self.assertEqual(coordinator.pending, {})
+        self.assertIn("Chat A\n- Chat B", coordinator.ntfy.messages[-1][1])
+
+    def test_empty_list_and_unavailable_codex_still_count_as_responses(self):
+        for unavailable in (False, True):
+            with self.subTest(unavailable=unavailable):
+                instance = make_bridge(names=[])
+                if unavailable:
+                    instance.chats.names.side_effect = bridge.CodexUnavailable()
+                instance.handle(event(), 1000)
+                deliver_messages(instance, instance, "response")
+                instance.finish(1000.01)
+                self.assertEqual(instance.pending, {})
+
+    def test_new_agent_joining_in_flight_is_added_and_targeted(self):
+        instance = make_bridge()
+        instance.handle(event(), 1000)
+        self.register(instance, "desktop-1", "Desktop")
+        self.assertIn("desktop-1", instance.pending["command-1"].expected)
+        payload = bridge.verified(instance.ntfy.messages[-1][1], instance.config.bus_secret, 1000)
+        self.assertEqual(payload["kind"], "list_request")
+        self.assertEqual(payload["target_device_id"], "desktop-1")
+        local = make_bridge(config(role="agent"))
+        local._bus(payload, 1000)
+        local.chats.names.assert_not_called()
+
+    def test_agent_announces_on_connection_but_combined_needs_no_publication(self):
+        instance = make_bridge(config(role="agent"))
+        instance.announce(1000)
+        payload = bridge.verified(instance.ntfy.messages[0][1], instance.config.bus_secret, 1000)
+        self.assertEqual(payload["kind"], "agent_online")
+        self.assertEqual(payload["device_id"], "mac-1")
+        combined = make_bridge()
+        combined.announce(1000)
+        self.assertEqual(combined.ntfy.messages, [])
+
+    def test_late_report_restores_online_status_without_second_reply(self):
+        instance = make_bridge()
+        self.register(instance, "desktop-1", "Desktop")
+        instance.handle(event(), 1000)
+        deliver_messages(instance, instance, "local-response")
+        instance.finish(1008)
+        count = len(instance.ntfy.messages)
+        instance._bus({"kind": "list_report", "request_id": "command-1",
+                       "device_id": "desktop-1", "device_name": "Desktop", "names": [],
+                       "part": 0, "parts": 1}, 1009)
+        self.assertIn("desktop-1", instance.state.online_agents(instance.cluster))
+        instance.finish(1009)
+        self.assertEqual(len(instance.ntfy.messages), count)
+
+    def test_unknown_roster_discovers_all_reports_before_enabling_fast_completion(self):
+        coordinator = make_bridge(config(role="coordinator"))
+        coordinator.handle(event(), 1000)
+        coordinator._bus({"kind": "list_report", "request_id": "command-1",
+                          "device_id": "mac-1", "device_name": "Mac", "names": ["Chat A"],
+                          "part": 0, "parts": 1}, 1000)
+        coordinator.finish(1000.1)
+        self.assertIn("command-1", coordinator.pending)
+        coordinator.finish(1008)
+        coordinator.handle(event("next", now=1009), 1009)
+        self.assertFalse(coordinator.pending["next"].discovery)
+        self.assertEqual(coordinator.pending["next"].expected, {"mac-1": "Mac"})
+
+    def test_registry_survives_restart_and_is_separate_per_cluster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            state = bridge.State(path)
+            state.remember_agent("cluster-one", "mac-1", "Mac", 1000)
+            state.remember_agent("cluster-one", "offline", "Offline", 1000)
+            state.offline_agent("cluster-one", "offline")
+            state.close()
+            state = bridge.State(path)
+            self.addCleanup(state.close)
+            self.assertEqual(state.online_agents("cluster-one"), {"mac-1": "Mac"})
+            self.assertEqual(state.online_agents("cluster-two"), {})
+
+    def test_restart_recovers_recent_registration_but_not_old_commands(self):
+        instance = make_bridge()
+        instance.started_at = 1010
+        payload = {"version": 1, "kind": "agent_online", "sent_at": 1000,
+                   "request_id": "desktop-1", "device_id": "desktop-1", "device_name": "Desktop"}
+        instance.handle(event("online", bridge.signed(payload, instance.config.bus_secret), "test-bus"), 1010)
+        self.assertIn("desktop-1", instance.state.online_agents(instance.cluster))
+        instance.handle(event("old-command", now=1000), 1010)
+        self.assertEqual(instance.pending, {})
+
+    def test_unexpected_partial_report_is_added_to_expected_computers(self):
+        instance = make_bridge()
+        instance.handle(event(), 1000)
+        deliver_messages(instance, instance, "local-response")
+        instance._bus({"kind": "list_report", "request_id": "command-1",
+                       "device_id": "new-desktop", "device_name": "Desktop", "names": ["One"],
+                       "part": 0, "parts": 2}, 1000)
+        instance.finish(1000.1)
+        self.assertIn("command-1", instance.pending)
 
 
 class RpcTests(unittest.TestCase):

@@ -25,8 +25,10 @@ python3 -m venv .venv
 ```
 
 The installer prints a new random ntfy topic. Subscribe to **that topic**, then
-publish the message `/list` to it. Expect one reply after roughly 8–12 seconds,
-containing chat names grouped by computer. You do not send `/list` to the old
+publish the message `/list` to it. The reply is sent as soon as all registered
+online computers have responded, with chat names grouped by computer. The
+8-second window is only a fallback for missing responses or initial discovery.
+You do not send `/list` to the old
 `codex_prompts` completion topic unless you explicitly choose it with `--topic`.
 Avoid using a predictable public topic for chat names.
 

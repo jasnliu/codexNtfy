@@ -22,7 +22,7 @@ import urllib.request
 
 
 LOG = logging.getLogger("codex-ntfy-list")
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_AGE = 60
 MAX_BODY = 3500  # Below ntfy's default 4096-byte limit, including UTF-8.
 DEFAULT_CONFIG = Path.home() / ".config/codex-ntfy-bridge/config.toml"
@@ -234,6 +234,9 @@ class State:
         self.connection = sqlite3.connect(path)
         os.chmod(path, 0o600)
         self.connection.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, time REAL)")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS agents (
+            cluster TEXT, id TEXT, name TEXT, online INTEGER, last_seen REAL,
+            PRIMARY KEY (cluster, id))""")
         self.connection.commit()
 
     def seen(self, event_id):
@@ -243,6 +246,21 @@ class State:
         with self.connection:
             self.connection.execute("INSERT OR IGNORE INTO seen VALUES (?,?)", (event_id, now))
             self.connection.execute("DELETE FROM seen WHERE time < ?", (now - 86400,))
+
+    def online_agents(self, cluster):
+        return dict(self.connection.execute(
+            "SELECT id, name FROM agents WHERE cluster=? AND online=1", (cluster,)))
+
+    def remember_agent(self, cluster, device_id, name, now):
+        with self.connection:
+            self.connection.execute("""INSERT INTO agents VALUES (?,?,?,1,?)
+                ON CONFLICT(cluster,id) DO UPDATE SET name=excluded.name,
+                online=1, last_seen=excluded.last_seen""", (cluster, device_id, name, now))
+
+    def offline_agent(self, cluster, device_id):
+        with self.connection:
+            self.connection.execute("UPDATE agents SET online=0 WHERE cluster=? AND id=?",
+                                    (cluster, device_id))
 
     def close(self):
         self.connection.close()
@@ -315,6 +333,8 @@ def message_parts(text):
 @dataclass
 class Pending:
     deadline: float
+    expected: dict = field(default_factory=dict)
+    discovery: bool = False
     reports: dict = field(default_factory=dict)
     reply: list | None = None
     next_part: int = 0
@@ -328,6 +348,19 @@ class Bridge:
         self.chats = chats or CodexChats(config.socket_path)
         self.pending = {}
         self.started_at = time.time()
+        self.cluster = hashlib.sha256(packed([
+            config.server, config.topic, config.bus_topic,
+        ]).encode()).hexdigest()
+        if config.coordinator and config.agent:
+            self.state.remember_agent(self.cluster, config.device_id,
+                                      config.device_name, self.started_at)
+
+    def announce(self, now):
+        # Presence is announced at connection time, not every few seconds:
+        # frequent heartbeat publications would exhaust ntfy's free message quota.
+        if self.config.agent and not self.config.coordinator:
+            self.emit("agent_online", self.config.device_id, now,
+                      device_id=self.config.device_id, device_name=self.config.device_name)
 
     def emit(self, kind, request_id, now, **extra):
         body = {"version": 1, "kind": kind, "request_id": request_id,
@@ -341,16 +374,23 @@ class Bridge:
         if (not isinstance(event_id, str) or not 1 <= len(event_id) <= 100
                 or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
                 or not math.isfinite(timestamp) or not -5 <= now - timestamp <= MAX_AGE
-                or timestamp < self.started_at - 2 or self.state.seen(event_id)):
+                or self.state.seen(event_id)):
             return
         topic, text = event.get("topic"), event.get("message")
         if not isinstance(text, str):
+            return
+        value = verified(text, self.config.bus_secret, now) if topic == self.config.bus_topic else None
+        # Recover a recent registration after restarting the coordinator, but
+        # never replay user commands or old list requests from before startup.
+        if timestamp < self.started_at - 2 and not (value and value.get("kind") == "agent_online"):
             return
         if topic == self.config.topic and self.config.coordinator and text.strip() == "/list":
             if event_id not in self.pending:
                 if len(self.pending) >= 20:
                     return  # Bound resource use; there is no model invocation here.
-                self.pending[event_id] = Pending(now + self.config.collect_seconds)
+                expected = self.state.online_agents(self.cluster)
+                self.pending[event_id] = Pending(now + self.config.collect_seconds,
+                                                expected=expected, discovery=not bool(expected))
                 try:
                     self.emit("list_request", event_id, now)
                 except Exception:
@@ -358,14 +398,27 @@ class Bridge:
                     raise
                 LOG.info("Accepted /list request")
         elif topic == self.config.bus_topic:
-            value = verified(text, self.config.bus_secret, now)
             if value:
                 self._bus(value, now)
         self.state.mark(event_id, now)
 
     def _bus(self, value, now):
         request_id = value["request_id"]
-        if value.get("kind") == "list_request" and self.config.agent:
+        if value.get("kind") == "agent_online" and self.config.coordinator:
+            device_id = value.get("device_id")
+            if not isinstance(device_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", device_id):
+                return
+            name = clean_name(value.get("device_name"), "Computer")[:64]
+            self.state.remember_agent(self.cluster, device_id, name, now)
+            # A computer can join while a request is already in flight. Probe
+            # that computer without making all the others repeat their work.
+            for pending_id, pending in self.pending.items():
+                if device_id not in pending.expected and pending.reply is None:
+                    self.emit("list_request", pending_id, now, target_device_id=device_id)
+                    pending.expected[device_id] = name
+        elif value.get("kind") == "list_request" and self.config.agent:
+            if value.get("target_device_id", self.config.device_id) != self.config.device_id:
+                return
             error = False
             try:
                 names = self.chats.names()
@@ -385,13 +438,19 @@ class Bridge:
             pending = self.pending.get(request_id)
             device_id, names = value.get("device_id"), value.get("names")
             part, parts = value.get("part"), value.get("parts")
-            if (not pending or pending.reply is not None
-                    or not isinstance(device_id, str) or not 1 <= len(device_id) <= 100
+            if (not isinstance(device_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", device_id)
                     or not isinstance(names, list) or len(names) > 2000
                     or any(not isinstance(name, str) for name in names)
                     or type(part) is not int or type(parts) is not int
                     or not 1 <= parts <= 1000 or not 0 <= part < parts):
                 return
+            # Even a late report is evidence that this agent is online for the
+            # next request. It must not cause a second reply to an old request.
+            self.state.remember_agent(self.cluster, device_id,
+                                      clean_name(value.get("device_name"), "Computer")[:64], now)
+            if not pending or pending.reply is not None:
+                return
+            pending.expected.setdefault(device_id, clean_name(value.get("device_name"), "Computer")[:64])
             if device_id not in pending.reports and len(pending.reports) >= 100:
                 return
             report = pending.reports.setdefault(device_id, {
@@ -403,10 +462,19 @@ class Bridge:
 
     def finish(self, now):
         for request_id, pending in list(self.pending.items()):
-            if now < pending.deadline:
+            complete = {device_id for device_id, report in pending.reports.items()
+                        if len(report["chunks"]) == report["parts"]}
+            all_responded = (bool(pending.expected) and not pending.discovery
+                             and pending.expected.keys() <= complete)
+            if pending.reply is None and now < pending.deadline and not all_responded:
                 continue
             if pending.reply is None:
                 lines = []
+                for device_id, name in sorted(pending.expected.items(), key=lambda item: item[1].casefold()):
+                    if device_id not in complete:
+                        self.state.offline_agent(self.cluster, device_id)
+                    if device_id not in pending.reports:
+                        lines.extend([f"{name}:", "No response (offline or timed out).", ""])
                 for report in sorted(pending.reports.values(), key=lambda item: item["name"].casefold()):
                     lines.append(f"{report['name']}:")
                     if report["unavailable"]:
@@ -426,16 +494,18 @@ class Bridge:
                 self.ntfy.publish(self.config.topic, pending.reply[pending.next_part], "Codex chats")
                 pending.next_part += 1
             del self.pending[request_id]
-            LOG.info("Replied to /list")
+            LOG.info("Replied to /list (%s)", "all computers responded" if all_responded else "timeout/discovery")
 
     def run(self):
         LOG.info("List bridge started (%s); only /list is supported", self.config.role)
-        watermark = self.started_at - 2
+        # Recover recent signed registrations; handle() still rejects old commands.
+        watermark = self.started_at - MAX_AGE
         delay = 1
         while True:
             try:
                 with self.ntfy.subscribe(max(watermark - 2, time.time() - MAX_AGE)) as connection:
                     LOG.info("Connected to ntfy; listening for list messages")
+                    self.announce(time.time())
                     while True:
                         try:
                             raw = connection.recv(timeout=self.config.tick_seconds)

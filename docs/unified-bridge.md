@@ -10,7 +10,8 @@
 3. Each online agent queries its existing local Codex daemon, without loading,
    resuming, starting, or interrupting any thread.
 4. Agents return signed reports containing the computer label and chat names.
-5. After the collection window, the coordinator sends one unified reply.
+5. As soon as all expected computers have returned complete reports, the
+   coordinator sends one unified reply, without a fixed collection delay.
    Only exceptionally large lists are split into numbered messages to respect
    ntfy's message-size limit. Multi-part agent reports are reassembled first.
 
@@ -34,9 +35,17 @@ filtered. A thread may stay loaded after its window closes. Availability is
 not an exact list of visible windows. Untitled chats are labelled `Untitled chat`;
 prompt previews are never substituted for names.
 
-This initial version discovers responding computers on demand. It does not keep
-a heartbeat-based offline inventory. A computer that is asleep, offline, or not
-running the agent will not appear. Late reports after a list reply are ignored.
+Remote agents announce their presence when connecting; the coordinator persists
+a registry of known responding agents. Each request snapshots its expected
+online computers. A new registration can add a computer to an in-flight request.
+Every expected multipart report must be complete before early completion.
+
+There are no periodic heartbeat messages. A silently disconnected computer can
+therefore remain expected until one request hits its timeout. That reply marks
+the missing computer clearly, and the registry stops waiting for it until a new
+registration/report arrives. Late reports update membership but do not produce
+duplicate replies. A coordinator with an entirely unknown roster uses one
+discovery window; a combined coordinator knows its local agent from the start.
 
 ## Security boundary for this test
 

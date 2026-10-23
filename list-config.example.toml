@@ -10,6 +10,7 @@ bus_secret = "REPLACE_WITH_A_SHARED_RANDOM_SECRET_AT_LEAST_32_CHARACTERS"
 role = "combined"
 device_name = "macbook"
 device_id = "REPLACE_WITH_A_UNIQUE_DEVICE_ID"
+# Maximum response timeout, NOT a mandatory delay. Complete lists reply immediately.
 collect_seconds = 8
 # Maximum wait between housekeeping ticks on the persistent subscription.
 tick_seconds = 1

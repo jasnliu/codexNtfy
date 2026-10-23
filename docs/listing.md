@@ -41,8 +41,9 @@ python3 -m venv .venv
 The installer defaults to `combined`, creates new random command and bus topics,
 generates a signing key and unique device ID, and prints the **command/reply**
 topic URL. Its installer/tests do not publish real test messages. Open that topic
-in your ntfy client, subscribe, and publish `/list` yourself. Wait approximately
-8–12 seconds for the combined reply. Keep message caching enabled when publishing
+in your ntfy client, subscribe, and publish `/list` yourself. The combined reply
+is sent as soon as every expected computer has returned its complete list. There
+is no fixed collection delay. Keep message caching enabled when publishing
 so a brief disconnect does not lose your request. Replies are cached using ntfy's
 normal retention so mobile clients and briefly disconnected subscribers can
 retrieve them. Subscribe to the topic to receive the notification.
@@ -134,10 +135,31 @@ starting it. The initial installer does not provision or store account tokens.
 Never put credentials in Git or embed them in a topic URL. TLS verification
 uses `certifi`; `SSL_CERT_FILE` can select a custom trusted CA bundle.
 
-The coordinator waits `collect_seconds` (default 8) for reports. Offline/sleeping
-computers are absent, not falsely labelled current. An available agent whose
-Codex server cannot be queried reports that clearly. Large lists are split into
-numbered ntfy replies instead of silently dropping names. Keep clocks in sync.
+The coordinator keeps a persistent registry of responding agents. Remote agents
+announce themselves when connecting; registrations and reports refresh the
+registry. The combined coordinator also registers itself locally. `/list` takes
+a snapshot of expected online agents, and replies **immediately after the last
+complete response**, including an empty list or a clear Codex-unavailable report.
+A newly joining agent can be added to a request that is still pending.
+
+`collect_seconds` (default 8) is now only a **maximum timeout**, not a minimum
+wait. A computer that disappears silently may delay one request until the timeout;
+the reply labels it offline/timed out, then subsequent requests stop waiting for
+it until it reconnects or reports again. A brand-new coordinator with no known
+agents uses the timeout once to discover the group rather than guessing that the
+first response is the last. A combined single-computer installation knows its
+local agent immediately and does not need that initial discovery wait.
+
+This is connection-time registration, not a heartbeat-based proof of liveness:
+the coordinator cannot instantly detect a sleeping/offline machine. Avoiding
+frequent heartbeat publications preserves ntfy's message allowance. Late reports
+update the registry for the next request, but do not generate a second reply.
+Update all enrolled agents for connection-time registration; older agents may
+only become known after their first report. Registered device IDs persist through
+coordinator restarts and are scoped to the configured cluster/topics.
+
+Large lists are split into numbered ntfy replies instead of silently dropping
+names. Keep clocks in sync.
 ntfy's own daily/rate limits still apply; each request uses at least a bus request
 and a user-facing reply, plus remote agent reports.
 
@@ -171,6 +193,7 @@ alone. Never uninstall while a request is in flight if you need its reply.
 The suite uses mocked HTTP, in-memory multi-computer report delivery,
 temporary-directory state, and fake read-only RPC responses. No automated test
 posts to ntfy. Tests cover command filtering, name-only replies, unified replies,
-signatures, stale/duplicate events, output byte limits, state permissions, and
-installer identity handling. Local live discovery and a live ntfy subscription
+signatures, stale/duplicate events, immediate all-agent completion, missing-agent
+timeouts, roster persistence, output byte limits, state permissions, and installer
+identity handling. Local live discovery and a live ntfy subscription
 can be checked without publishing a test notification.
