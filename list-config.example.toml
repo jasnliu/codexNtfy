@@ -1,0 +1,23 @@
+# Copy to ~/.config/codex-ntfy-bridge/config.toml, or use install_list.py.
+# Keep the real config out of Git. All enrolled devices share the topics/key.
+server = "https://ntfy.sh"
+topic = "REPLACE_WITH_A_LONG_RANDOM_TEST_TOPIC"
+bus_topic = "REPLACE_WITH_A_DIFFERENT_LONG_RANDOM_TOPIC"
+bus_secret = "REPLACE_WITH_A_SHARED_RANDOM_SECRET_AT_LEAST_32_CHARACTERS"
+
+# Exactly one coordinator per group. Other computers use role = "agent".
+# "combined" runs the coordinator and a local agent together.
+role = "combined"
+device_name = "macbook"
+device_id = "REPLACE_WITH_A_UNIQUE_DEVICE_ID"
+collect_seconds = 8
+# Maximum wait between housekeeping ticks on the persistent subscription.
+tick_seconds = 1
+
+# Optional: default is $CODEX_HOME/app-server-control/app-server-control.sock,
+# or ~/.codex/app-server-control/app-server-control.sock.
+# socket_path = "/absolute/path/to/app-server-control.sock"
+
+# For protected ntfy topics, export a token in this environment variable.
+# Never commit an actual token. Unset/empty means no ntfy account authentication.
+token_env = "CODEX_NTFY_TOKEN"

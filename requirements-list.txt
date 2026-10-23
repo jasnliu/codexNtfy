@@ -1,0 +1,3 @@
+# Only the optional /list companion needs this dependency.
+websockets==16.1.1
+certifi==2026.10.19

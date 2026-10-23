@@ -1,10 +1,41 @@
 # codexNtfy
 
-Codex completion notifications through [ntfy](https://ntfy.sh).
+Codex completion notifications and a read-only `/list` companion through
+[ntfy](https://ntfy.sh).
 
-This repository contains the existing **outgoing completion notifier**. It does
-**not yet implement** incoming prompts, `/list`, chat aliases, multi-computer
-discovery, or the unified coordinator. See [the roadmap](docs/unified-bridge.md).
+There are two independent features:
+
+- **Completion notifier:** the existing script, unchanged.
+- **Listing companion:** send `/list` to receive the names of available chats.
+  One coordinator combines results from computers with enrolled agents.
+
+`/list` is the **only** incoming command. Incoming prompts, `/send`, `/rename`,
+and arbitrary command execution are not implemented. Unknown messages are ignored.
+
+## Try `/list`
+
+On the first computer (Python 3.11+, macOS or Linux):
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-list.txt
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python list_bridge.py --local-list
+.venv/bin/python install_list.py --device-name macbook
+```
+
+The installer prints a new random ntfy topic. Subscribe to **that topic**, then
+publish the message `/list` to it. Expect one reply after roughly 8–12 seconds,
+containing chat names grouped by computer. You do not send `/list` to the old
+`codex_prompts` completion topic unless you explicitly choose it with `--topic`.
+Avoid using a predictable public topic for chat names.
+
+On macOS, installation starts a persistent login LaunchAgent. On Linux it prints
+the foreground command to run instead. It does not change Codex settings or
+restart Codex. No real test message is sent by installation or the tests.
+
+See [listing setup and testing](docs/listing.md) for enrolling another computer,
+operational limits, privacy, and uninstall instructions.
 
 ## What it does
 
@@ -29,7 +60,9 @@ only to a finished final response. Some clients display the HTML comment as text
 
 Requirements: Git, Python **3.11+** for the installer/tests, and a Codex client
 that honors the user-level `notify` and `model_instructions_file` settings.
-No third-party Python packages are required. Different Codex clients/versions
+No third-party Python packages are required for completion notifications.
+The optional listing companion uses the pinned dependencies in
+`requirements-list.txt`. Different Codex clients/versions
 should be verified individually; this is not a native Codex plugin.
 
 ```sh
@@ -85,6 +118,10 @@ Restart Codex if settings or instruction files changed. The script itself is
 executed afresh on each notification. Keep the configured Python interpreter
 installed; rerun the installer if its location changes.
 
+These update instructions apply to the completion notifier. To update the
+listing companion, also rerun `python3 install_list.py`; it preserves its local
+device identity and cluster configuration and restarts only its own service.
+
 GitHub distributes code; it does **not** synchronize active chats or update
 installed files automatically. There is no auto-updater. Installation copies
 the scripts rather than linking to the clone, so pulling alone does not deploy
@@ -100,8 +137,10 @@ or installation.
 - There is no authentication in this existing notifier. For private alerts,
   adapt the URL and authentication for a protected topic before deploying it.
   Keep tokens outside the repository.
-- This code never subscribes to ntfy or executes incoming messages. Never use
-  this unauthenticated completion topic as a remote command channel.
+- The completion script never subscribes to ntfy or executes incoming messages.
+  The optional listing companion subscribes separately and recognizes only
+  `/list`. It cannot send prompts to Codex. Never use the unauthenticated
+  completion topic as a future remote prompt/command channel.
 - Do not commit `~/.codex/config.toml`, `auth.json`, databases, session logs,
   local credentials, or sound scripts to this repository.
 
@@ -120,7 +159,12 @@ Restart Codex. Uninstalling does not require changing Codex's application files.
 | `notification-final-marker.md` | Existing completion-marker instructions |
 | `install.py` | Portable installation with backups and conflict checks |
 | `tests/` | Mocked HTTP/sound tests and temporary-directory installer tests |
-| `docs/unified-bridge.md` | Planned incoming-command and multi-device architecture |
+| `list_bridge.py` | Read-only agents and unified `/list` coordinator |
+| `install_list.py` | Isolated listing installation and macOS login service |
+| `list-config.example.toml` | Example only; real local config contains secrets |
+| `requirements-list.txt` | Optional listing dependencies |
+| `docs/listing.md` | Listing setup, tests, limits, and uninstall |
+| `docs/unified-bridge.md` | Current architecture and future work |
 
 References: [Codex configuration](https://learn.chatgpt.com/docs/config-file/config-reference),
 [Codex app-server](https://learn.chatgpt.com/docs/app-server),

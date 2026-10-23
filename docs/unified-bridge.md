@@ -1,75 +1,70 @@
-# Unified multi-computer bridge: planned, not implemented
+# Unified multi-computer bridge
 
-The current repository only sends completion notifications. The following is a
-design outline for a future companion service, not documentation of working
-commands.
+## Implemented: `/list` only
 
-## Roles
+`list_bridge.py` can run as a local **agent**, a **coordinator**, or both
+(`combined`). Exactly one computer should run the coordinator for a group.
 
-- **Agent on each computer:** connect to that computer's existing Codex server,
-  discover available conversations, maintain stable aliases tied to thread IDs,
-  report status, and deliver authenticated messages to explicitly named chats.
-- **One coordinator:** track enrolled devices and heartbeats, collect fresh
-  reports for `/list`, and send one combined response. Mark missing reports as
-  stale/offline rather than silently treating them as current.
-- **ntfy transport:** carry authenticated commands and reports on separate
-  channels from user-facing replies and the existing completion alerts.
+1. A user publishes `/list` to the configured command/reply topic.
+2. The coordinator broadcasts an HMAC-signed `list_request` on the internal bus.
+3. Each online agent queries its existing local Codex daemon, without loading,
+   resuming, starting, or interrupting any thread.
+4. Agents return signed reports containing the computer label and chat names.
+5. After the collection window, the coordinator sends one unified reply.
+   Only exceptionally large lists are split into numbered messages to respect
+   ntfy's message-size limit. Multi-part agent reports are reassembled first.
 
-For example, `/send desktop/moosic Run the tests` would address the `moosic`
-alias on the explicitly named `desktop` device. A saved registry would keep
-aliases stable, rather than renumbering chats every time `/list` is requested.
-Names should be collision-safe and should not reveal full prompts by default.
+The combined role incorporates its own local result directly. Remote agents
+never post user-facing replies; the coordinator owns each request and reply.
 
-The coordinator can run beside an agent on an always-on computer or on a server.
-If it is offline, unified commands are unavailable. Automatic failover is not
-part of the initial design.
+Persistent WebSocket subscriptions avoid frequent HTTP polling. A short cached
+replay window, processed-event IDs stored in SQLite, and message-age validation
+handle brief disconnections. Internal reports use a separate random bus topic
+and a shared HMAC key. All computers must have reasonably synchronized clocks.
 
-## Codex integration
+No live chat database or history is synchronized through GitHub. Device IDs,
+topic names, signing keys, processed IDs, and live local configuration stay
+outside the repository. See [setup](listing.md).
 
-Use supported local interfaces, not direct writes to Codex's databases. The
-documented app-server exposes `thread/loaded/list`, `thread/read`, thread names,
-and runtime status. The local CLI inspected during planning also exposed
-`codex queue --thread ... --message ...`.
+## Availability semantics
 
-Verify API/CLI capabilities and connection to the **existing running server**
-on each supported Codex version/client before implementing discovery or delivery.
-Starting a separate server is not proof of access to chats in another client.
-Loaded threads can remain in memory after a window closes, so label the results
-as available sessions, not an exact list of visible windows. Filter out internal
-recap and child-agent threads by default. Keep existing sandbox and approval
-policies; remotely queued prompts are not approval bypasses.
+An available chat is a loaded, user-facing thread on an enrolled computer's
+existing local Codex server. Internal/child-agent and ephemeral threads are
+filtered. A thread may stay loaded after its window closes. Availability is
+not an exact list of visible windows. Untitled chats are labelled `Untitled chat`;
+prompt previews are never substituted for names.
 
-## Local state, not Git synchronization
+This initial version discovers responding computers on demand. It does not keep
+a heartbeat-based offline inventory. A computer that is asleep, offline, or not
+running the agent will not appear. Late reports after a list reply are ignored.
 
-Future state would live outside the clone:
+## Security boundary for this test
 
-```text
-~/.config/codex-ntfy-bridge/config.toml       # device ID, role, channel settings
-~/.local/share/codex-ntfy-bridge/state.sqlite3 # aliases, processed IDs, device state
-```
+Only `/list` is accepted from the command topic. Every other message is ignored.
+The local Codex adapter allows only `initialize`, `thread/loaded/list`, and
+`thread/read`, plus the `initialized` handshake notification. It never invokes
+an LLM or sends prompts. The existing completion notifier is independent.
 
-Keep credentials in the OS keychain or a restricted secrets file. Store code,
-configuration examples, tests, and launch-service templates in GitHub. Never
-commit live state or Codex credentials. Report agent/protocol versions in
-heartbeats so incompatible devices can be identified after updates.
+The user-facing topic is not sender-authenticated by this code. Its long random
+name reduces accidental discovery, but **is not account access control**.
+Anyone with topic access can request/read names. Prefer protected ntfy topics
+for real private use. Signing protects internal reports against parties without
+the cluster key, but is not encryption; ntfy can read message bodies. Account
+authentication, when configured, uses an environment-provided bearer token.
 
-## Required security and reliability
+The coordinator needs to remain online. There is no automatic failover,
+exactly-once reply guarantee across a crash, or durable pending-request queue.
+Requests in progress during a restart may need to be sent again. This is a
+testing companion, not a production remote-control service.
 
-- Protected ntfy topics plus authenticated device enrollment and authorized
-  command senders; an obscure topic name alone is not command authentication.
-- Signed/validated message envelopes, unique message IDs, expiry timestamps,
-  request IDs, and replay/duplicate protection.
-- Durable acknowledgement tracking. Do not blindly resend ambiguous deliveries
-  after a crash, since that could run a prompt twice.
-- Reject stale commands after sleep or reconnection; never replay the entire
-  topic cache as executable work.
-- Explicit device/chat addressing and an acknowledgement identifying the target.
-- One coordinator owns a list request and emits one bounded-size reply (or
-  explicitly numbered parts if it exceeds ntfy's message limit).
-- Separate command, report, reply, and completion channels to prevent loops.
-- Privacy controls for chat names and working-directory metadata sent through
-  ntfy; transport authentication does not make the service provider unable to
-  read message bodies.
+## Future work (not commands you can use today)
+
+- Stable chat aliases, explicit device/chat routing, `/send`, `/rename`.
+- Authenticated user-command enrollment and authorization before any remote
+  prompt execution is considered; preserve sandbox and approval policies.
+- Heartbeats/offline inventory, version negotiation, and coordinator failover.
+- Durable request/reply delivery and stronger replay protection for commands
+  with side effects. Current deduplication is adequate only for read-only lists.
 
 References: [Codex app-server](https://learn.chatgpt.com/docs/app-server),
 [ntfy subscriptions](https://docs.ntfy.sh/subscribe/api/).
