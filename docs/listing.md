@@ -4,7 +4,9 @@
 
 Publish exactly `/list` (surrounding whitespace is allowed) to the configured
 ntfy topic. The coordinator replies to the same topic with the names of available
-Codex chats, grouped by computer. Other commands/text, including `/send`, are
+Codex chats, grouped by computer and numbered consecutively starting from 1.
+Numbering continues across computers and multipart replies; it does not restart
+for each computer. Other commands/text, including `/send` or a number alone, are
 ignored. No message is forwarded into a Codex conversation.
 
 Example reply:
@@ -13,16 +15,29 @@ Example reply:
 Available Codex chats
 
 desktop:
-- Update music player
+1. Update music player
 
 macbook:
-- Fix skip quizzes
-- Untitled chat
+2. Fix skip quizzes
+3. Untitled chat
 ```
 
 Only computers running an enrolled agent can contribute. Installing this
 companion once on a computer covers that computer's available daemon-backed
 user chats; it is not installed separately into each chat.
+
+Numbers belong to that particular list, not permanent global chat IDs. Every
+new `/list` starts at 1; adding/removing/renaming a chat can change its number.
+The coordinator saves the displayed number, device ID, and permanent thread ID
+in its private SQLite state after the whole reply is successfully published.
+The latest successful snapshot and up to 20 recent snapshots are retained for
+future selection support. Duplicate chat names still get distinct numbers.
+Actual thread IDs are not printed in the user-facing reply.
+
+Selection and sending are **not enabled yet**. A message such as `2` is ignored.
+Older agents that only report names can still appear with numbers, but their
+thread reference is explicitly unknown, never guessed by name. Upgrade all
+agents before future number-based routing is enabled.
 
 ## First computer: coordinator and local agent
 
@@ -125,7 +140,8 @@ persist locally to suppress duplicate delivery after reconnect/restart.
 
 This is **read-only testing**. A random topic name is not account authentication.
 Anyone who obtains the command topic can request or read chat names. Internal
-bus signatures are not encryption, and cached reports are visible to the ntfy
+bus signatures are not encryption, and cached reports (including internal
+thread references, but not conversation history) are visible to the ntfy
 server. For privacy, use protected topics on ntfy and restrict both topics.
 
 For protected topics, provide a bearer token through the configured `token_env`
@@ -194,6 +210,7 @@ The suite uses mocked HTTP, in-memory multi-computer report delivery,
 temporary-directory state, and fake read-only RPC responses. No automated test
 posts to ntfy. Tests cover command filtering, name-only replies, unified replies,
 signatures, stale/duplicate events, immediate all-agent completion, missing-agent
-timeouts, roster persistence, output byte limits, state permissions, and installer
+timeouts, roster persistence, continuous numbering, saved chat-reference snapshots,
+duplicate names, output byte limits, state permissions, and installer
 identity handling. Local live discovery and a live ntfy subscription
 can be checked without publishing a test notification.

@@ -7,10 +7,13 @@ There are two independent features:
 
 - **Completion notifier:** the existing script, unchanged.
 - **Listing companion:** send `/list` to receive the names of available chats.
-  One coordinator combines results from computers with enrolled agents.
+  One coordinator combines results from computers with enrolled agents and
+  numbers the chats starting at 1 across the entire list.
 
 `/list` is the **only** incoming command. Incoming prompts, `/send`, `/rename`,
-and arbitrary command execution are not implemented. Unknown messages are ignored.
+numeric chat selection, and arbitrary command execution are not implemented.
+Unknown messages are ignored. Number-to-chat references are saved locally for
+future selection support; numbering is a snapshot of the most recent list.
 
 ## Try `/list`
 

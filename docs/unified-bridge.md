@@ -9,14 +9,21 @@
 2. The coordinator broadcasts an HMAC-signed `list_request` on the internal bus.
 3. Each online agent queries its existing local Codex daemon, without loading,
    resuming, starting, or interrupting any thread.
-4. Agents return signed reports containing the computer label and chat names.
+4. Agents return signed reports containing the computer label, chat names, and
+   internal thread references. Thread references are never shown in the reply.
 5. As soon as all expected computers have returned complete reports, the
    coordinator sends one unified reply, without a fixed collection delay.
+   Chats are numbered from 1 across all computers, not separately per device.
    Only exceptionally large lists are split into numbered messages to respect
    ntfy's message-size limit. Multi-part agent reports are reassembled first.
 
 The combined role incorporates its own local result directly. Remote agents
 never post user-facing replies; the coordinator owns each request and reply.
+
+After successful delivery, the coordinator persists the exact number-to-device/
+thread mapping for that list, so a future selector need not guess from names or
+recompute a changed list. Numbering restarts on the next `/list`; duplicate names
+are separate entries. Numeric selection and message sending remain disabled.
 
 Persistent WebSocket subscriptions avoid frequent HTTP polling. A short cached
 replay window, processed-event IDs stored in SQLite, and message-age validation

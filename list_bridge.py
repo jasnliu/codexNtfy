@@ -22,7 +22,7 @@ import urllib.request
 
 
 LOG = logging.getLogger("codex-ntfy-list")
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_AGE = 60
 MAX_BODY = 3500  # Below ntfy's default 4096-byte limit, including UTF-8.
 DEFAULT_CONFIG = Path.home() / ".config/codex-ntfy-bridge/config.toml"
@@ -114,6 +114,9 @@ class CodexChats:
         self.socket_path = socket_path
 
     def names(self):
+        return [entry["name"] for entry in self.entries()]
+
+    def entries(self):
         # Lazy import keeps the original completion notifier dependency-free.
         from websockets.sync.client import unix_connect
         from websockets.exceptions import WebSocketException
@@ -121,12 +124,15 @@ class CodexChats:
         try:
             with unix_connect(self.socket_path, open_timeout=3, close_timeout=1,
                               max_size=8 * 1024 * 1024) as connection:
-                return self._names(connection)
+                return self._entries(connection)
         except (OSError, TimeoutError, WebSocketException, ValueError, KeyError,
                 TypeError, AttributeError) as error:
             raise CodexUnavailable("Cannot query the running Codex server") from error
 
     def _names(self, connection):
+        return [entry["name"] for entry in self._entries(connection)]
+
+    def _entries(self, connection):
         next_id = 0
         deadline = time.monotonic() + 5
 
@@ -164,7 +170,7 @@ class CodexChats:
             if cursor in cursors:
                 raise CodexUnavailable("Codex returned a repeated listing cursor")
             cursors.add(cursor)
-        names = []
+        entries = []
         for thread_id in dict.fromkeys(ids):
             try:
                 thread = call("thread/read", {"threadId": thread_id,
@@ -181,8 +187,9 @@ class CodexChats:
                     or str(source).lower().startswith("subagent")):
                 continue
             # Never use a prompt preview as the name of an untitled conversation.
-            names.append(clean_name(thread.get("name")))
-        return sorted(names, key=str.casefold)
+            entries.append({"id": str(thread.get("id") or thread_id),
+                            "name": clean_name(thread.get("name"))})
+        return sorted(entries, key=lambda entry: (entry["name"].casefold(), entry["id"]))
 
 
 class Ntfy:
@@ -237,6 +244,11 @@ class State:
         self.connection.execute("""CREATE TABLE IF NOT EXISTS agents (
             cluster TEXT, id TEXT, name TEXT, online INTEGER, last_seen REAL,
             PRIMARY KEY (cluster, id))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS list_snapshots (
+            cluster TEXT, list_id TEXT, saved_at REAL, entries TEXT,
+            PRIMARY KEY (cluster, list_id))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS latest_list (
+            cluster TEXT PRIMARY KEY, list_id TEXT)""")
         self.connection.commit()
 
     def seen(self, event_id):
@@ -261,6 +273,30 @@ class State:
         with self.connection:
             self.connection.execute("UPDATE agents SET online=0 WHERE cluster=? AND id=?",
                                     (cluster, device_id))
+
+    def save_list(self, cluster, list_id, entries, now):
+        """Remember exactly the displayed numbering, not a future re-sorted list."""
+        with self.connection:
+            self.connection.execute("""INSERT INTO list_snapshots VALUES (?,?,?,?)
+                ON CONFLICT(cluster,list_id) DO UPDATE SET saved_at=excluded.saved_at,
+                entries=excluded.entries""", (cluster, list_id, now, packed(entries)))
+            self.connection.execute("""INSERT INTO latest_list VALUES (?,?)
+                ON CONFLICT(cluster) DO UPDATE SET list_id=excluded.list_id""", (cluster, list_id))
+            self.connection.execute("""DELETE FROM list_snapshots WHERE cluster=? AND list_id NOT IN (
+                SELECT list_id FROM list_snapshots WHERE cluster=?
+                ORDER BY saved_at DESC, rowid DESC LIMIT 20)
+                AND list_id != ?""", (cluster, cluster, list_id))
+
+    def get_list(self, cluster, list_id=None):
+        if list_id is None:
+            row = self.connection.execute("SELECT list_id FROM latest_list WHERE cluster=?",
+                                          (cluster,)).fetchone()
+            if row is None:
+                return []
+            list_id = row[0]
+        row = self.connection.execute("SELECT entries FROM list_snapshots WHERE cluster=? AND list_id=?",
+                                      (cluster, list_id)).fetchone()
+        return json.loads(row[0]) if row else []
 
     def close(self):
         self.connection.close()
@@ -298,14 +334,14 @@ def verified(text, secret, now):
         return None
 
 
-def name_batches(names):
+def chat_batches(entries):
     batches, current = [], []
-    for name in names:
-        name = clean_name(name)
-        if current and len(packed(current + [name]).encode()) > 2000:
+    for entry in entries:
+        entry = {"id": entry["id"], "name": clean_name(entry["name"])}
+        if current and len(packed(current + [entry]).encode()) > 2000:
             batches.append(current)
             current = []
-        current.append(name)
+        current.append(entry)
     batches.append(current)
     return batches
 
@@ -338,6 +374,7 @@ class Pending:
     reports: dict = field(default_factory=dict)
     reply: list | None = None
     next_part: int = 0
+    selections: list = field(default_factory=list)
 
 
 class Bridge:
@@ -421,14 +458,16 @@ class Bridge:
                 return
             error = False
             try:
-                names = self.chats.names()
+                entries = self.chats.entries()
             except CodexUnavailable:
-                names, error = [], True
+                entries, error = [], True
                 LOG.warning("Local Codex server is unavailable")
-            batches = name_batches(names)
+            batches = chat_batches(entries)
             for index, batch in enumerate(batches):
                 fields = dict(device_id=self.config.device_id, device_name=self.config.device_name,
-                              names=batch, unavailable=error, part=index, parts=len(batches))
+                              names=[entry["name"] for entry in batch],
+                              thread_ids=[entry["id"] for entry in batch],
+                              unavailable=error, part=index, parts=len(batches))
                 if self.config.coordinator and request_id in self.pending:
                     # The combined coordinator already owns its local result.
                     self._bus({"kind": "list_report", "request_id": request_id, **fields}, now)
@@ -437,12 +476,20 @@ class Bridge:
         elif value.get("kind") == "list_report" and self.config.coordinator:
             pending = self.pending.get(request_id)
             device_id, names = value.get("device_id"), value.get("names")
+            thread_ids = value.get("thread_ids")
             part, parts = value.get("part"), value.get("parts")
             if (not isinstance(device_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", device_id)
                     or not isinstance(names, list) or len(names) > 2000
                     or any(not isinstance(name, str) for name in names)
                     or type(part) is not int or type(parts) is not int
                     or not 1 <= parts <= 1000 or not 0 <= part < parts):
+                return
+            # Older agents can still list names, but those entries must not be
+            # guessed/routed by name when selection is implemented later.
+            if thread_ids is None:
+                thread_ids = [None] * len(names)
+            elif (not isinstance(thread_ids, list) or len(thread_ids) != len(names)
+                  or any(not isinstance(item, str) or not 1 <= len(item) <= 200 for item in thread_ids)):
                 return
             # Even a late report is evidence that this agent is online for the
             # next request. It must not cause a second reply to an old request.
@@ -458,7 +505,8 @@ class Bridge:
                 "parts": parts, "chunks": {}, "unavailable": bool(value.get("unavailable")),
             })
             if report["parts"] == parts:
-                report["chunks"][part] = [clean_name(name) for name in names]
+                report["chunks"][part] = [{"name": clean_name(name), "id": thread_id}
+                                         for name, thread_id in zip(names, thread_ids)]
 
     def finish(self, now):
         for request_id, pending in list(self.pending.items()):
@@ -475,17 +523,24 @@ class Bridge:
                         self.state.offline_agent(self.cluster, device_id)
                     if device_id not in pending.reports:
                         lines.extend([f"{name}:", "No response (offline or timed out).", ""])
-                for report in sorted(pending.reports.values(), key=lambda item: item["name"].casefold()):
+                for device_id, report in sorted(pending.reports.items(),
+                        key=lambda item: (item[1]["name"].casefold(), item[0])):
                     lines.append(f"{report['name']}:")
                     if report["unavailable"]:
                         lines.append("Codex is not running or is unavailable.")
                     elif len(report["chunks"]) != report["parts"]:
                         lines.append("Chat list incomplete; try /list again.")
                     else:
-                        names = [name for part in range(report["parts"])
-                                 for name in report["chunks"][part]]
-                        lines.extend(f"- {name}" for name in names)
-                        if not names:
+                        entries = [entry for part in range(report["parts"])
+                                   for entry in report["chunks"][part]]
+                        entries.sort(key=lambda entry: (entry["name"].casefold(), entry["id"] or ""))
+                        for entry in entries:
+                            number = len(pending.selections) + 1
+                            lines.append(f"{number}. {entry['name']}")
+                            pending.selections.append({"number": number, "device_id": device_id,
+                                "device_name": report["name"], "thread_id": entry["id"],
+                                "name": entry["name"]})
+                        if not entries:
                             lines.append("No available chats.")
                     lines.append("")
                 body = "Available Codex chats\n\n" + "\n".join(lines).rstrip() if lines else "No computers reported available chats."
@@ -493,6 +548,7 @@ class Bridge:
             while pending.next_part < len(pending.reply):
                 self.ntfy.publish(self.config.topic, pending.reply[pending.next_part], "Codex chats")
                 pending.next_part += 1
+            self.state.save_list(self.cluster, request_id, pending.selections, now)
             del self.pending[request_id]
             LOG.info("Replied to /list (%s)", "all computers responded" if all_responded else "timeout/discovery")
 

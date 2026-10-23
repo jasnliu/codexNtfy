@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import sys
 import tempfile
 import tomllib
@@ -35,6 +36,8 @@ class MemoryState:
     def __init__(self):
         self.ids = set()
         self.agents = {}
+        self.snapshots = {}
+        self.latest = {}
 
     def seen(self, event_id):
         return event_id in self.ids
@@ -54,6 +57,14 @@ class MemoryState:
         self.agents[(cluster, device_id)] = (name, False)
 
 
+    def save_list(self, cluster, list_id, entries, now):
+        self.snapshots[(cluster, list_id)] = [dict(entry) for entry in entries]
+        self.latest[cluster] = list_id
+
+    def get_list(self, cluster, list_id=None):
+        return self.snapshots.get((cluster, list_id or self.latest.get(cluster)), [])
+
+
 class CaptureNtfy:
     def __init__(self):
         self.messages = []
@@ -65,7 +76,10 @@ class CaptureNtfy:
 def make_bridge(settings=None, names=None):
     ntfy = CaptureNtfy()
     chats = Mock()
-    chats.names.return_value = names if names is not None else ["Chat A", "Chat B"]
+    chat_names = names if names is not None else ["Chat A", "Chat B"]
+    chats.entries.return_value = [
+        {"id": f"thread-{index}", "name": name} for index, name in enumerate(chat_names)
+    ]
     instance = bridge.Bridge(settings or config(), MemoryState(), ntfy, chats)
     instance.started_at = 999
     return instance
@@ -80,11 +94,11 @@ def deliver_messages(sender, receiver, prefix, now=1000):
 class CommandTests(unittest.TestCase):
     def test_only_exact_list_is_a_command(self):
         instance = make_bridge()
-        for index, text in enumerate(("hello", "/send test hi", "/rename", "/list all",
+        for index, text in enumerate(("hello", "1", "/select 1", "/send test hi", "/rename", "/list all",
                                       "/LIST", '{"method":"turn/start"}', "Codex finished responding.")):
             instance.handle(event(str(index), text), 1000)
         self.assertEqual(instance.ntfy.messages, [])
-        instance.chats.names.assert_not_called()
+        instance.chats.entries.assert_not_called()
         instance.handle(event("accepted", " \n/list\t"), 1000)
         self.assertEqual(len(instance.ntfy.messages), 1)
 
@@ -98,7 +112,7 @@ class CommandTests(unittest.TestCase):
         topic, reply, title = instance.ntfy.messages[-1]
         self.assertEqual(topic, "test-commands")
         self.assertEqual(title, "Codex chats")
-        self.assertEqual(reply, "Available Codex chats\n\nMac:\n- Fix quizzes\n- Music player\n- Untitled chat")
+        self.assertEqual(reply, "Available Codex chats\n\nMac:\n1. Fix quizzes\n2. Music player\n3. Untitled chat")
         self.assertEqual(instance.pending, {})
         # Reading the reply on the same topic cannot produce a feedback loop.
         count = len(instance.ntfy.messages)
@@ -118,9 +132,9 @@ class CommandTests(unittest.TestCase):
         coordinator.finish(1009)
         replies = [value for value in coordinator.ntfy.messages if value[0] == "test-commands"]
         self.assertEqual(len(replies), 1)
-        self.assertIn("Desktop:\n- Desktop chat", replies[0][1])
-        self.assertIn("Mac:\n- Mac chat", replies[0][1])
-        coordinator.chats.names.assert_not_called()
+        self.assertIn("Desktop:\n1. Desktop chat", replies[0][1])
+        self.assertIn("Mac:\n2. Mac chat", replies[0][1])
+        coordinator.chats.entries.assert_not_called()
 
     def test_agent_ignores_user_commands(self):
         instance = make_bridge(config(role="agent"))
@@ -153,7 +167,7 @@ class CommandTests(unittest.TestCase):
                  "request_id": "bad"}
         forged = bridge.signed(value, "wrong-secret")
         instance.handle(event("forgery", forged, "test-bus"), 1000)
-        instance.chats.names.assert_not_called()
+        instance.chats.entries.assert_not_called()
 
     def test_no_reporting_devices_returns_a_clear_reply(self):
         instance = make_bridge(config(role="coordinator"))
@@ -163,7 +177,7 @@ class CommandTests(unittest.TestCase):
 
     def test_codex_unavailable_is_distinct_from_empty_list(self):
         instance = make_bridge()
-        instance.chats.names.side_effect = bridge.CodexUnavailable("private filesystem path")
+        instance.chats.entries.side_effect = bridge.CodexUnavailable("private filesystem path")
         instance.handle(event(), 1000)
         deliver_messages(instance, instance, "bus")
         instance.finish(1009)
@@ -226,6 +240,104 @@ class CommandTests(unittest.TestCase):
             self.assertIn(name, "\n".join(replies))
 
 
+class NumberingTests(unittest.TestCase):
+    def complete_local(self, instance, request_id="command-1", now=1000):
+        instance.handle(event(request_id, now=now), now)
+        deliver_messages(instance, instance, f"bus-{request_id}", now=now)
+        instance.finish(now + 0.01)
+
+    def test_numbers_start_at_one_and_save_exact_device_thread_references(self):
+        instance = make_bridge(names=["Alpha", "Beta"])
+        self.complete_local(instance)
+        snapshot = instance.state.get_list(instance.cluster)
+        self.assertEqual([(item["number"], item["name"], item["device_id"], item["thread_id"])
+                          for item in snapshot], [(1, "Alpha", "mac-1", "thread-0"),
+                                                (2, "Beta", "mac-1", "thread-1")])
+        self.assertIn("1. Alpha\n2. Beta", instance.ntfy.messages[-1][1])
+
+    def test_duplicate_names_remain_separate_and_are_not_used_as_identity(self):
+        instance = make_bridge()
+        instance.chats.entries.return_value = [{"id": "thread-b", "name": "Same name"},
+                                               {"id": "thread-a", "name": "Same name"}]
+        self.complete_local(instance)
+        snapshot = instance.state.get_list(instance.cluster)
+        self.assertEqual([item["thread_id"] for item in snapshot], ["thread-a", "thread-b"])
+        self.assertIn("1. Same name\n2. Same name", instance.ntfy.messages[-1][1])
+
+    def test_new_list_restarts_numbering_and_does_not_change_old_snapshot(self):
+        instance = make_bridge(names=["Beta"])
+        self.complete_local(instance, "first")
+        instance.chats.entries.return_value = [{"id": "new-thread", "name": "Alpha"},
+                                               {"id": "thread-0", "name": "Beta"}]
+        self.complete_local(instance, "second", now=1001)
+        first = instance.state.get_list(instance.cluster, "first")
+        latest = instance.state.get_list(instance.cluster)
+        self.assertEqual([(item["number"], item["name"]) for item in first], [(1, "Beta")])
+        self.assertEqual([(item["number"], item["name"]) for item in latest], [(1, "Alpha"), (2, "Beta")])
+
+    def test_failed_reply_does_not_replace_latest_successful_numbering(self):
+        instance = make_bridge(names=["Original"])
+        self.complete_local(instance, "first")
+        instance.chats.entries.return_value = [{"id": "new-thread", "name": "Replacement"}]
+        instance.handle(event("second", now=1001), 1001)
+        deliver_messages(instance, instance, "second-bus", now=1001)
+        with patch.object(instance.ntfy, "publish", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                instance.finish(1001.1)
+        self.assertEqual(instance.state.get_list(instance.cluster)[0]["name"], "Original")
+        instance.finish(1001.2)
+        self.assertEqual(instance.state.get_list(instance.cluster)[0]["name"], "Replacement")
+
+    def test_multipart_numbering_continues_without_restarting(self):
+        names = [f"Chat {index:03d} " + "漢" * 100 for index in range(30)]
+        instance = make_bridge(names=names)
+        self.complete_local(instance)
+        replies = [item[1] for item in instance.ntfy.messages if item[0] == "test-commands"]
+        self.assertGreater(len(replies), 1)
+        numbers = [int(number) for reply in replies for number in re.findall(r"^(\d+)\. ", reply, re.MULTILINE)]
+        self.assertEqual(numbers, list(range(1, 31)))
+        self.assertEqual([item["number"] for item in instance.state.get_list(instance.cluster)], list(range(1, 31)))
+
+    def test_legacy_name_only_report_has_no_guessed_thread_id(self):
+        instance = make_bridge(config(role="coordinator"))
+        instance.handle(event(), 1000)
+        instance._bus({"kind": "list_report", "request_id": "command-1",
+                       "device_id": "old-agent", "device_name": "Old computer", "names": ["Legacy chat"],
+                       "part": 0, "parts": 1}, 1000)
+        instance.finish(1008)
+        self.assertIn("1. Legacy chat", instance.ntfy.messages[-1][1])
+        self.assertIsNone(instance.state.get_list(instance.cluster)[0]["thread_id"])
+
+    def test_invalid_thread_reference_arrays_are_rejected(self):
+        for thread_ids in (["one", "two"], [None], "one", [""]):
+            with self.subTest(thread_ids=thread_ids):
+                instance = make_bridge(config(role="coordinator"))
+                instance.handle(event(), 1000)
+                instance._bus({"kind": "list_report", "request_id": "command-1",
+                               "device_id": "mac-1", "device_name": "Mac", "names": ["Chat"],
+                               "thread_ids": thread_ids, "part": 0, "parts": 1}, 1000)
+                self.assertEqual(instance.pending["command-1"].reports, {})
+
+    def test_snapshot_mapping_survives_restart_and_is_scoped_to_cluster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            entries = [{"number": 1, "device_id": "mac-1", "thread_id": "permanent-id",
+                        "device_name": "Mac", "name": "Chat"}]
+            state = bridge.State(path)
+            state.save_list("cluster-a", "list-a", entries, 1000)
+            state.close()
+            reopened = bridge.State(path)
+            try:
+                self.assertEqual(reopened.get_list("cluster-a"), entries)
+                self.assertEqual(reopened.get_list("cluster-a", "list-a"), entries)
+                self.assertEqual(reopened.get_list("cluster-b"), [])
+                for index in range(30):
+                    reopened.save_list("cluster-a", f"next-{index}", [], 1001 + index)
+                self.assertEqual(reopened.get_list("cluster-a", "list-a"), [])
+            finally:
+                reopened.close()
+
+
 class EarlyCompletionTests(unittest.TestCase):
     def register(self, instance, device_id, name, identifier="online"):
         payload = {"version": 1, "kind": "agent_online", "sent_at": 1000,
@@ -281,14 +393,14 @@ class EarlyCompletionTests(unittest.TestCase):
         coordinator._bus({**payload, "part": 1, "names": ["Chat B"]}, 1000)
         coordinator.finish(1000.2)
         self.assertEqual(coordinator.pending, {})
-        self.assertIn("Chat A\n- Chat B", coordinator.ntfy.messages[-1][1])
+        self.assertIn("Chat A\n2. Chat B", coordinator.ntfy.messages[-1][1])
 
     def test_empty_list_and_unavailable_codex_still_count_as_responses(self):
         for unavailable in (False, True):
             with self.subTest(unavailable=unavailable):
                 instance = make_bridge(names=[])
                 if unavailable:
-                    instance.chats.names.side_effect = bridge.CodexUnavailable()
+                    instance.chats.entries.side_effect = bridge.CodexUnavailable()
                 instance.handle(event(), 1000)
                 deliver_messages(instance, instance, "response")
                 instance.finish(1000.01)
@@ -304,7 +416,7 @@ class EarlyCompletionTests(unittest.TestCase):
         self.assertEqual(payload["target_device_id"], "desktop-1")
         local = make_bridge(config(role="agent"))
         local._bus(payload, 1000)
-        local.chats.names.assert_not_called()
+        local.chats.entries.assert_not_called()
 
     def test_agent_announces_on_connection_but_combined_needs_no_publication(self):
         instance = make_bridge(config(role="agent"))
